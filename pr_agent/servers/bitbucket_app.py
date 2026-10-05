@@ -3,10 +3,13 @@ import base64
 import binascii
 import copy
 import hashlib
+import hmac
 import json
 import math
 import os
+import re
 import time
+import urllib.parse
 
 import jwt
 import requests
@@ -40,6 +43,33 @@ router = APIRouter()
 validate_secret_provider_setting()
 
 _secret_provider_state = {}
+
+_CLIENT_KEY_RE = re.compile(r"^[a-zA-Z0-9_.:{}/@=-]+$")
+
+
+def _is_valid_client_key(client_key: str) -> bool:
+    """Validate clientKey shape before using it as a secret provider key."""
+    if not isinstance(client_key, str) or not client_key or len(client_key) > 256:
+        return False
+    if ".." in client_key:
+        return False
+    return bool(_CLIENT_KEY_RE.match(client_key))
+
+
+def _compute_qsh(method: str, path: str, query: str = "") -> str:
+    """Compute the Query String Hash (QSH) for Bitbucket Cloud Atlassian Connect JWT."""
+    canonical_method = method.upper()
+    canonical_path = path if path.startswith("/") else f"/{path}"
+    if len(canonical_path) > 1 and canonical_path.endswith("/"):
+        canonical_path = canonical_path.rstrip("/")
+    if query:
+        parsed = urllib.parse.parse_qsl(query, keep_blank_values=True)
+        sorted_params = sorted(parsed, key=lambda kv: (kv[0], kv[1]))
+        canonical_query = urllib.parse.urlencode(sorted_params)
+    else:
+        canonical_query = ""
+    canonical_url = f"{canonical_method}&{canonical_path}&{canonical_query}"
+    return hashlib.sha256(canonical_url.encode("utf-8")).hexdigest()
 
 
 def _get_request_timeout():
@@ -79,13 +109,10 @@ async def get_bearer_token(shared_secret: str, client_key: str):
             "exp": now + 240,
             "qsh": qsh,
             "sub": client_key,
-            }
-        token = jwt.encode(payload, shared_secret, algorithm="HS256")
-        payload = 'grant_type=urn%3Abitbucket%3Aoauth2%3Ajwt'
-        headers = {
-            'Authorization': f'JWT {token}',
-            'Content-Type': 'application/x-www-form-urlencoded'
         }
+        token = jwt.encode(payload, shared_secret, algorithm="HS256")
+        payload = "grant_type=urn%3Abitbucket%3Aoauth2%3Ajwt"
+        headers = {"Authorization": f"JWT {token}", "Content-Type": "application/x-www-form-urlencoded"}
         response = await asyncio.to_thread(
             requests.request,
             "POST",
@@ -99,6 +126,7 @@ async def get_bearer_token(shared_secret: str, client_key: str):
     except Exception as e:
         get_logger().error(f"Failed to get bearer token: {e}")
         raise e
+
 
 @router.get("/")
 async def handle_manifest(request: Request, response: Response):
@@ -140,21 +168,18 @@ def _get_username(data):
 async def _validate_time_from_last_commit_to_pr_update(data: dict) -> bool:
     is_valid_push = False
     try:
-        data_inner = data.get('data', {})
+        data_inner = data.get("data", {})
         if not data_inner:
             get_logger().error("No data found in the webhook payload")
             return True
-        pull_request = data_inner.get('pullrequest', {})
-        commits_api = pull_request.get('links', {}).get('commits', {}).get('href')
+        pull_request = data_inner.get("pullrequest", {})
+        commits_api = pull_request.get("links", {}).get("commits", {}).get("href")
         if not commits_api:
             return False
-        if not pull_request.get('updated_on'):
+        if not pull_request.get("updated_on"):
             return False
-        bearer_token = context.get('bitbucket_bearer_token')
-        headers = {
-            'Authorization': f'Bearer {bearer_token}',
-            'Accept': 'application/json'
-        }
+        bearer_token = context.get("bitbucket_bearer_token")
+        headers = {"Authorization": f"Bearer {bearer_token}", "Accept": "application/json"}
         response = await asyncio.to_thread(
             requests.get,
             commits_api,
@@ -165,24 +190,30 @@ async def _validate_time_from_last_commit_to_pr_update(data: dict) -> bool:
             get_logger().warning(f"Bitbucket commits API returned {response.status_code} for {commits_api}")
             return False
 
-        username =_get_username(data)
+        username = _get_username(data)
         commits_data = response.json() or {}
-        values = commits_data.get('values') or []
-        if (not values or not isinstance(values, list)
-                or not values[0].get('author') or not values[0]['author'].get('user')
-                or not values[0]['author']['user'].get('display_name')):
+        values = commits_data.get("values") or []
+        if (
+            not values
+            or not isinstance(values, list)
+            or not values[0].get("author")
+            or not values[0]["author"].get("user")
+            or not values[0]["author"]["user"].get("display_name")
+        ):
             get_logger().warning(
                 "No commits returned for pull request or one of the required fields missing; skipping push validation",
-                artifact={'values': values})
+                artifact={"values": values},
+            )
             return False
-        commit_username = commits_data['values'][0]['author']['user']['display_name']
+        commit_username = commits_data["values"][0]["author"]["user"]["display_name"]
         if username != commit_username:
             get_logger().warning(f"Mismatch in username {username} vs. commit_username {commit_username}")
             return False
 
-        time_pr_updated = pull_request['updated_on']
-        time_last_commit = commits_data['values'][0]['date']
+        time_pr_updated = pull_request["updated_on"]
+        time_last_commit = commits_data["values"][0]["date"]
         from datetime import datetime
+
         ts1 = datetime.fromisoformat(time_pr_updated)
         ts2 = datetime.fromisoformat(time_last_commit)
         diff = (ts1 - ts2).total_seconds()
@@ -190,12 +221,16 @@ async def _validate_time_from_last_commit_to_pr_update(data: dict) -> bool:
         if diff > 0 and diff < max_delta_seconds:
             is_valid_push = True
         else:
-            get_logger().debug("Too much time passed since last commit",
-                               artifact={'updated': time_pr_updated, 'last_commit': time_last_commit})
+            get_logger().debug(
+                "Too much time passed since last commit",
+                artifact={"updated": time_pr_updated, "last_commit": time_last_commit},
+            )
     except Exception as e:
-        get_logger().exception("Failed to validate time difference between last commit and PR update",
-                               artifact={'error': e, 'data': data})
+        get_logger().exception(
+            "Failed to validate time difference between last commit and PR update", artifact={"error": e, "data": data}
+        )
     return is_valid_push
+
 
 async def _perform_commands_bitbucket(commands_conf: str, agent: PRAgent, api_url: str, log_context: dict, data: dict):
     apply_repo_settings(api_url)
@@ -205,8 +240,7 @@ async def _perform_commands_bitbucket(commands_conf: str, agent: PRAgent, api_ur
         return
     if commands_conf == "push_commands":
         if not get_settings().get("bitbucket_app.handle_push_trigger"):
-            get_logger().info(
-                "Bitbucket push trigger handling disabled via config; skipping push commands")
+            get_logger().info("Bitbucket push trigger handling disabled via config; skipping push commands")
             return
     # Filter both command types here, after apply_repo_settings, so repository-level
     # ignore rules (ignore_pr_authors, ignore_pr_title, branch filters) also cover
@@ -326,31 +360,30 @@ async def handle_github_webhooks(background_tasks: BackgroundTasks, request: Req
             except Exception as e:
                 get_logger().error(f"Failed to look up Bitbucket shared secret: {e}")
                 return
-            # Atlassian Connect issues JWTs with aud == uri of the app descriptor.
-            # Pin the audience to the configured base_url so a forged JWT cannot
-            # satisfy the audience check by mirroring its own iss. Guard against
-            # the key being absent (it's not in the shipped .secrets_template.toml)
-            # so a missing-config deployment fails cleanly instead of raising
-            # AttributeError on every webhook and rejecting valid tokens.
             try:
-                expected_audience = get_settings().bitbucket.base_url
-            except AttributeError:
-                get_logger().error(
-                    "Bitbucket webhook JWT validation skipped: bitbucket.base_url is not configured"
+                decoded = jwt.decode(
+                    input_jwt,
+                    shared_secret,
+                    algorithms=["HS256"],
+                    options={"verify_aud": False},
                 )
-                return
-            if not expected_audience:
-                get_logger().error(
-                    "Bitbucket webhook JWT validation skipped: bitbucket.base_url is empty"
-                )
-                return
-            try:
-                jwt.decode(input_jwt, shared_secret, audience=expected_audience, algorithms=["HS256"])
             except jwt.InvalidTokenError as e:
                 get_logger().error(f"Bitbucket webhook JWT validation failed: {e}")
                 return
+            token_qsh = decoded.get("qsh")
+            if not token_qsh or not isinstance(token_qsh, str):
+                get_logger().error("Bitbucket webhook JWT is missing 'qsh' claim")
+                return
+            expected_qsh = _compute_qsh(
+                method=request.method,
+                path=request.url.path,
+                query=request.url.query,
+            )
+            if not (token_qsh == "context-qsh" or hmac.compare_digest(token_qsh, expected_qsh)):
+                get_logger().error("Bitbucket webhook JWT validation failed: qsh mismatch")
+                return
             bearer_token = await get_bearer_token(shared_secret, client_key)
-            context['bitbucket_bearer_token'] = bearer_token
+            context["bitbucket_bearer_token"] = bearer_token
             context["settings"] = copy.deepcopy(global_settings)
             event = data["event"]
             agent = PRAgent()
@@ -360,17 +393,21 @@ async def handle_github_webhooks(background_tasks: BackgroundTasks, request: Req
                 log_context["event"] = "pull_request"
                 if pr_url:
                     with get_logger().contextualize(**log_context):
-                        if get_identity_provider().verify_eligibility("bitbucket",
-                                                        sender_id, pr_url) is not Eligibility.NOT_ELIGIBLE:
+                        if (
+                            get_identity_provider().verify_eligibility("bitbucket", sender_id, pr_url)
+                            is not Eligibility.NOT_ELIGIBLE
+                        ):
                             await _perform_commands_bitbucket("pr_commands", agent, pr_url, log_context, data)
-            elif event == "pullrequest:updated": # PR updated, might be from a push (we will validate this later)
+            elif event == "pullrequest:updated":  # PR updated, might be from a push (we will validate this later)
                 pr_url = data["data"]["pullrequest"]["links"]["html"]["href"]
                 log_context["api_url"] = pr_url
                 log_context["event"] = "pull_request"
                 if pr_url:
                     with get_logger().contextualize(**log_context):
-                        if get_identity_provider().verify_eligibility("bitbucket",
-                                                        sender_id, pr_url) is not Eligibility.NOT_ELIGIBLE:
+                        if (
+                            get_identity_provider().verify_eligibility("bitbucket", sender_id, pr_url)
+                            is not Eligibility.NOT_ELIGIBLE
+                        ):
                             await _perform_commands_bitbucket("push_commands", agent, pr_url, log_context, data)
             elif event == "pullrequest:comment_created":
                 pr_url = data["data"]["pullrequest"]["links"]["html"]["href"]
@@ -381,17 +418,22 @@ async def handle_github_webhooks(background_tasks: BackgroundTasks, request: Req
                     get_logger().info("Ignoring comment not starting with /")
                     return
                 with get_logger().contextualize(**log_context):
-                    if get_identity_provider().verify_eligibility("bitbucket",
-                                                                     sender_id, pr_url) is not Eligibility.NOT_ELIGIBLE:
+                    if (
+                        get_identity_provider().verify_eligibility("bitbucket", sender_id, pr_url)
+                        is not Eligibility.NOT_ELIGIBLE
+                    ):
                         await agent.handle_request(pr_url, comment_body)
         except Exception as e:
             get_logger().error(f"Failed to handle webhook: {e}")
+
     background_tasks.add_task(inner)
     return "OK"
+
 
 @router.get("/webhook")
 async def handle_webhook_health(request: Request, response: Response):
     return "Webhook server online!"
+
 
 @router.post("/installed")
 async def handle_installed_webhooks(request: Request, response: Response):
@@ -419,15 +461,58 @@ async def handle_installed_webhooks(request: Request, response: Response):
     shared_secret = data["sharedSecret"]
     client_key = data["clientKey"]
     username = principal["username"]
+
+    if not _is_valid_client_key(client_key):
+        get_logger().error("Failed to register user: invalid clientKey format")
+        return JSONResponse({"error": "Unable to register user"}, status_code=500)
+
+    secret_provider = get_fork_safe_secret_provider()
+    if not secret_provider:
+        get_logger().error("Failed to register user: secret provider not configured")
+        return JSONResponse({"error": "Unable to register user"}, status_code=500)
+
+    # For a clientKey that already has an entry (re-installation), require a JWT
+    # signed with the currently stored secret (Atlassian's documented reinstall pattern).
+    existing_secret_data = None
+    if hasattr(secret_provider, "get_secret"):
+        try:
+            raw_secret = secret_provider.get_secret(client_key)
+            if raw_secret:
+                existing_secret_data = json.loads(raw_secret)
+        except Exception as e:
+            get_logger().warning(f"Error checking existing secret for clientKey: {type(e).__name__}")
+            existing_secret_data = None
+
+    if existing_secret_data and isinstance(existing_secret_data, dict) and "shared_secret" in existing_secret_data:
+        existing_shared_secret = existing_secret_data["shared_secret"]
+        jwt_header = request.headers.get("authorization", None)
+        jwt_parts = jwt_header.split() if jwt_header else []
+        if len(jwt_parts) != 2 or jwt_parts[0].casefold() != "jwt":
+            get_logger().error("Bitbucket re-installation rejected: missing or malformed authorization header")
+            return JSONResponse({"error": "Unauthorized re-installation"}, status_code=401)
+        reinstall_jwt = jwt_parts[1]
+        try:
+            jwt.decode(
+                reinstall_jwt,
+                existing_shared_secret,
+                algorithms=["HS256"],
+                options={"verify_aud": False},
+            )
+        except jwt.InvalidTokenError as e:
+            get_logger().error(f"Bitbucket re-installation rejected: invalid JWT signature ({e})")
+            return JSONResponse({"error": "Unauthorized re-installation"}, status_code=401)
+
     secrets = {
         "shared_secret": shared_secret,
-        "client_key": client_key
+        "client_key": client_key,
+        "username": username,
     }
     try:
-        get_fork_safe_secret_provider().store_secret(username, json.dumps(secrets))
+        secret_provider.store_secret(client_key, json.dumps(secrets))
     except Exception as e:
         get_logger().error(f"Failed to register user: secret provider failure ({type(e).__name__})")
         return JSONResponse({"error": "Unable to register user"}, status_code=500)
+
 
 @router.post("/uninstalled")
 async def handle_uninstalled_webhooks(request: Request, response: Response):
@@ -448,5 +533,5 @@ def start():
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "3000")))
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     start()
