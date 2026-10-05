@@ -473,34 +473,39 @@ async def handle_installed_webhooks(request: Request, response: Response):
 
     # For a clientKey that already has an entry (re-installation), require a JWT
     # signed with the currently stored secret (Atlassian's documented reinstall pattern).
-    existing_secret_data = None
     if hasattr(secret_provider, "get_secret"):
         try:
             raw_secret = secret_provider.get_secret(client_key)
-            if raw_secret:
-                existing_secret_data = json.loads(raw_secret)
         except Exception as e:
-            get_logger().warning(f"Error checking existing secret for clientKey: {type(e).__name__}")
-            existing_secret_data = None
+            get_logger().error(f"Failed to check existing secret for clientKey: {type(e).__name__}")
+            return JSONResponse({"error": "Unable to verify existing installation"}, status_code=500)
 
-    if existing_secret_data and isinstance(existing_secret_data, dict) and "shared_secret" in existing_secret_data:
-        existing_shared_secret = existing_secret_data["shared_secret"]
-        jwt_header = request.headers.get("authorization", None)
-        jwt_parts = jwt_header.split() if jwt_header else []
-        if len(jwt_parts) != 2 or jwt_parts[0].casefold() != "jwt":
-            get_logger().error("Bitbucket re-installation rejected: missing or malformed authorization header")
-            return JSONResponse({"error": "Unauthorized re-installation"}, status_code=401)
-        reinstall_jwt = jwt_parts[1]
-        try:
-            jwt.decode(
-                reinstall_jwt,
-                existing_shared_secret,
-                algorithms=["HS256"],
-                options={"verify_aud": False},
-            )
-        except jwt.InvalidTokenError as e:
-            get_logger().error(f"Bitbucket re-installation rejected: invalid JWT signature ({e})")
-            return JSONResponse({"error": "Unauthorized re-installation"}, status_code=401)
+        if raw_secret:
+            try:
+                existing_secret_data = json.loads(raw_secret)
+                existing_shared_secret = existing_secret_data["shared_secret"]
+            except Exception as e:
+                get_logger().error(
+                    f"Bitbucket re-installation rejected: stored secret is malformed ({type(e).__name__})"
+                )
+                return JSONResponse({"error": "Unable to verify existing installation"}, status_code=500)
+
+            jwt_header = request.headers.get("authorization", None)
+            jwt_parts = jwt_header.split() if jwt_header else []
+            if len(jwt_parts) != 2 or jwt_parts[0].casefold() != "jwt":
+                get_logger().error("Bitbucket re-installation rejected: missing or malformed authorization header")
+                return JSONResponse({"error": "Unauthorized re-installation"}, status_code=401)
+            reinstall_jwt = jwt_parts[1]
+            try:
+                jwt.decode(
+                    reinstall_jwt,
+                    existing_shared_secret,
+                    algorithms=["HS256"],
+                    options={"verify_aud": False},
+                )
+            except jwt.InvalidTokenError as e:
+                get_logger().error(f"Bitbucket re-installation rejected: invalid JWT signature ({e})")
+                return JSONResponse({"error": "Unauthorized re-installation"}, status_code=401)
 
     secrets = {
         "shared_secret": shared_secret,

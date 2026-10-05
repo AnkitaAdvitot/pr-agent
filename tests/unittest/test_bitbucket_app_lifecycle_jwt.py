@@ -43,6 +43,7 @@ def _route_endpoint(path, method):
 # --- /installed: Name shape validation and clientKey storage ---
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "client_key",
     [
@@ -74,6 +75,7 @@ async def test_installed_stores_secret_keyed_by_valid_client_key(monkeypatch, cl
     assert data["username"] == "principal-user"
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "bad_client_key",
     [
@@ -105,6 +107,7 @@ async def test_installed_rejects_invalid_client_key_shape(monkeypatch, bad_clien
 # --- /installed: Re-installation JWT verification ---
 
 
+@pytest.mark.asyncio
 async def test_installed_first_install_succeeds_without_auth_header(monkeypatch):
     provider = _InMemorySecretProvider()
     monkeypatch.setattr(bitbucket_app, "get_fork_safe_secret_provider", lambda: provider)
@@ -121,6 +124,7 @@ async def test_installed_first_install_succeeds_without_auth_header(monkeypatch)
     assert provider.get_secret("workspace-uuid-1") != ""
 
 
+@pytest.mark.asyncio
 async def test_installed_reinstall_rejects_without_auth_header(monkeypatch):
     old_secrets = {"shared_secret": "old-secret-val", "client_key": "workspace-uuid-1"}
     provider = _InMemorySecretProvider({"workspace-uuid-1": json.dumps(old_secrets)})
@@ -139,6 +143,7 @@ async def test_installed_reinstall_rejects_without_auth_header(monkeypatch):
     assert len(provider.stored) == 0
 
 
+@pytest.mark.asyncio
 async def test_installed_reinstall_rejects_with_wrong_jwt_signature(monkeypatch):
     old_secrets = {"shared_secret": "old-secret-val-32-bytes-long-key!", "client_key": "workspace-uuid-1"}
     provider = _InMemorySecretProvider({"workspace-uuid-1": json.dumps(old_secrets)})
@@ -162,6 +167,7 @@ async def test_installed_reinstall_rejects_with_wrong_jwt_signature(monkeypatch)
     assert len(provider.stored) == 0
 
 
+@pytest.mark.asyncio
 async def test_installed_reinstall_accepts_valid_jwt_signed_with_stored_secret(monkeypatch):
     old_secrets = {"shared_secret": "old-secret-val-32-bytes-long-key!", "client_key": "workspace-uuid-1"}
     provider = _InMemorySecretProvider({"workspace-uuid-1": json.dumps(old_secrets)})
@@ -188,6 +194,7 @@ async def test_installed_reinstall_accepts_valid_jwt_signed_with_stored_secret(m
 # --- /webhook: QSH and aud verification ---
 
 
+@pytest.mark.asyncio
 async def test_webhook_verifies_valid_qsh_without_aud_claim(monkeypatch):
     shared_secret = "secret-12345-very-long-secret-key-32bytes"
     client_key = "workspace-client-key"
@@ -245,6 +252,7 @@ async def test_webhook_verifies_valid_qsh_without_aud_claim(monkeypatch):
     assert len(called_commands) == 1
 
 
+@pytest.mark.asyncio
 async def test_webhook_accepts_context_qsh(monkeypatch):
     shared_secret = "secret-12345-very-long-secret-key-32bytes"
     client_key = "workspace-client-key"
@@ -296,6 +304,7 @@ async def test_webhook_accepts_context_qsh(monkeypatch):
     assert len(called_commands) == 1
 
 
+@pytest.mark.asyncio
 async def test_webhook_rejects_mismatched_qsh(monkeypatch):
     shared_secret = "secret-12345-very-long-secret-key-32bytes"
     client_key = "workspace-client-key"
@@ -339,5 +348,58 @@ async def test_webhook_rejects_mismatched_qsh(monkeypatch):
     assert result == "OK"
 
     await background_tasks()
-    # The command should NOT have been performed because qsh mismatched
+    # Verify that a mismatched qsh prevents command execution.
     assert len(called_commands) == 0
+
+
+# --- /installed: Fail-closed verification on provider or secret corruption ---
+
+
+@pytest.mark.asyncio
+async def test_installed_fails_closed_when_secret_provider_raises(monkeypatch):
+    class _FailingSecretProvider:
+        def get_secret(self, key):
+            raise RuntimeError("Database connection lost")
+
+    monkeypatch.setattr(bitbucket_app, "get_fork_safe_secret_provider", lambda: _FailingSecretProvider())
+    payload = {
+        "sharedSecret": "secret-val-123",
+        "clientKey": "workspace-uuid-1",
+        "principal": {"username": "user1"},
+    }
+    request = _Request({}, payload)
+    result = await _route_endpoint("/installed", "POST")(request, None)
+    assert result.status_code == 500
+    assert json.loads(result.body.decode())["error"] == "Unable to verify existing installation"
+
+
+@pytest.mark.asyncio
+async def test_installed_fails_closed_when_stored_secret_malformed_json(monkeypatch):
+    provider = _InMemorySecretProvider({"workspace-uuid-1": "{not-valid-json"})
+    monkeypatch.setattr(bitbucket_app, "get_fork_safe_secret_provider", lambda: provider)
+    payload = {
+        "sharedSecret": "secret-val-123",
+        "clientKey": "workspace-uuid-1",
+        "principal": {"username": "user1"},
+    }
+    request = _Request({}, payload)
+    result = await _route_endpoint("/installed", "POST")(request, None)
+    assert result.status_code == 500
+    assert json.loads(result.body.decode())["error"] == "Unable to verify existing installation"
+    assert len(provider.stored) == 0
+
+
+@pytest.mark.asyncio
+async def test_installed_fails_closed_when_stored_secret_missing_shared_secret(monkeypatch):
+    provider = _InMemorySecretProvider({"workspace-uuid-1": json.dumps({"client_key": "workspace-uuid-1"})})
+    monkeypatch.setattr(bitbucket_app, "get_fork_safe_secret_provider", lambda: provider)
+    payload = {
+        "sharedSecret": "secret-val-123",
+        "clientKey": "workspace-uuid-1",
+        "principal": {"username": "user1"},
+    }
+    request = _Request({}, payload)
+    result = await _route_endpoint("/installed", "POST")(request, None)
+    assert result.status_code == 500
+    assert json.loads(result.body.decode())["error"] == "Unable to verify existing installation"
+    assert len(provider.stored) == 0
