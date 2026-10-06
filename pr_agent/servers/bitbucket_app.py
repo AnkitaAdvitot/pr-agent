@@ -9,7 +9,6 @@ import math
 import os
 import re
 import time
-import urllib.parse
 
 import jwt
 import requests
@@ -56,20 +55,10 @@ def _is_valid_client_key(client_key: str) -> bool:
     return bool(_CLIENT_KEY_RE.match(client_key))
 
 
-def _compute_qsh(method: str, path: str, query: str = "") -> str:
-    """Compute the Query String Hash (QSH) for Bitbucket Cloud Atlassian Connect JWT."""
-    canonical_method = method.upper()
-    canonical_path = path if path.startswith("/") else f"/{path}"
-    if len(canonical_path) > 1 and canonical_path.endswith("/"):
-        canonical_path = canonical_path.rstrip("/")
-    if query:
-        parsed = urllib.parse.parse_qsl(query, keep_blank_values=True)
-        sorted_params = sorted(parsed, key=lambda kv: (kv[0], kv[1]))
-        canonical_query = urllib.parse.urlencode(sorted_params)
-    else:
-        canonical_query = ""
-    canonical_url = f"{canonical_method}&{canonical_path}&{canonical_query}"
-    return hashlib.sha256(canonical_url.encode("utf-8")).hexdigest()
+def _compute_qsh(method: str, path: str) -> str:
+    """Compute the Atlassian Connect qsh for a request that carries no query string."""
+    canonical_path = path.rstrip("/") or "/"
+    return hashlib.sha256(f"{method.upper()}&{canonical_path}&".encode("utf-8")).hexdigest()
 
 
 def _get_request_timeout():
@@ -109,10 +98,13 @@ async def get_bearer_token(shared_secret: str, client_key: str):
             "exp": now + 240,
             "qsh": qsh,
             "sub": client_key,
-        }
+            }
         token = jwt.encode(payload, shared_secret, algorithm="HS256")
-        payload = "grant_type=urn%3Abitbucket%3Aoauth2%3Ajwt"
-        headers = {"Authorization": f"JWT {token}", "Content-Type": "application/x-www-form-urlencoded"}
+        payload = 'grant_type=urn%3Abitbucket%3Aoauth2%3Ajwt'
+        headers = {
+            'Authorization': f'JWT {token}',
+            'Content-Type': 'application/x-www-form-urlencoded'
+        }
         response = await asyncio.to_thread(
             requests.request,
             "POST",
@@ -126,7 +118,6 @@ async def get_bearer_token(shared_secret: str, client_key: str):
     except Exception as e:
         get_logger().error(f"Failed to get bearer token: {e}")
         raise e
-
 
 @router.get("/")
 async def handle_manifest(request: Request, response: Response):
@@ -168,18 +159,21 @@ def _get_username(data):
 async def _validate_time_from_last_commit_to_pr_update(data: dict) -> bool:
     is_valid_push = False
     try:
-        data_inner = data.get("data", {})
+        data_inner = data.get('data', {})
         if not data_inner:
             get_logger().error("No data found in the webhook payload")
             return True
-        pull_request = data_inner.get("pullrequest", {})
-        commits_api = pull_request.get("links", {}).get("commits", {}).get("href")
+        pull_request = data_inner.get('pullrequest', {})
+        commits_api = pull_request.get('links', {}).get('commits', {}).get('href')
         if not commits_api:
             return False
-        if not pull_request.get("updated_on"):
+        if not pull_request.get('updated_on'):
             return False
-        bearer_token = context.get("bitbucket_bearer_token")
-        headers = {"Authorization": f"Bearer {bearer_token}", "Accept": "application/json"}
+        bearer_token = context.get('bitbucket_bearer_token')
+        headers = {
+            'Authorization': f'Bearer {bearer_token}',
+            'Accept': 'application/json'
+        }
         response = await asyncio.to_thread(
             requests.get,
             commits_api,
@@ -190,30 +184,24 @@ async def _validate_time_from_last_commit_to_pr_update(data: dict) -> bool:
             get_logger().warning(f"Bitbucket commits API returned {response.status_code} for {commits_api}")
             return False
 
-        username = _get_username(data)
+        username =_get_username(data)
         commits_data = response.json() or {}
-        values = commits_data.get("values") or []
-        if (
-            not values
-            or not isinstance(values, list)
-            or not values[0].get("author")
-            or not values[0]["author"].get("user")
-            or not values[0]["author"]["user"].get("display_name")
-        ):
+        values = commits_data.get('values') or []
+        if (not values or not isinstance(values, list)
+                or not values[0].get('author') or not values[0]['author'].get('user')
+                or not values[0]['author']['user'].get('display_name')):
             get_logger().warning(
                 "No commits returned for pull request or one of the required fields missing; skipping push validation",
-                artifact={"values": values},
-            )
+                artifact={'values': values})
             return False
-        commit_username = commits_data["values"][0]["author"]["user"]["display_name"]
+        commit_username = commits_data['values'][0]['author']['user']['display_name']
         if username != commit_username:
             get_logger().warning(f"Mismatch in username {username} vs. commit_username {commit_username}")
             return False
 
-        time_pr_updated = pull_request["updated_on"]
-        time_last_commit = commits_data["values"][0]["date"]
+        time_pr_updated = pull_request['updated_on']
+        time_last_commit = commits_data['values'][0]['date']
         from datetime import datetime
-
         ts1 = datetime.fromisoformat(time_pr_updated)
         ts2 = datetime.fromisoformat(time_last_commit)
         diff = (ts1 - ts2).total_seconds()
@@ -221,16 +209,12 @@ async def _validate_time_from_last_commit_to_pr_update(data: dict) -> bool:
         if diff > 0 and diff < max_delta_seconds:
             is_valid_push = True
         else:
-            get_logger().debug(
-                "Too much time passed since last commit",
-                artifact={"updated": time_pr_updated, "last_commit": time_last_commit},
-            )
+            get_logger().debug("Too much time passed since last commit",
+                               artifact={'updated': time_pr_updated, 'last_commit': time_last_commit})
     except Exception as e:
-        get_logger().exception(
-            "Failed to validate time difference between last commit and PR update", artifact={"error": e, "data": data}
-        )
+        get_logger().exception("Failed to validate time difference between last commit and PR update",
+                               artifact={'error': e, 'data': data})
     return is_valid_push
-
 
 async def _perform_commands_bitbucket(commands_conf: str, agent: PRAgent, api_url: str, log_context: dict, data: dict):
     apply_repo_settings(api_url)
@@ -240,7 +224,8 @@ async def _perform_commands_bitbucket(commands_conf: str, agent: PRAgent, api_ur
         return
     if commands_conf == "push_commands":
         if not get_settings().get("bitbucket_app.handle_push_trigger"):
-            get_logger().info("Bitbucket push trigger handling disabled via config; skipping push commands")
+            get_logger().info(
+                "Bitbucket push trigger handling disabled via config; skipping push commands")
             return
     # Filter both command types here, after apply_repo_settings, so repository-level
     # ignore rules (ignore_pr_authors, ignore_pr_title, branch filters) also cover
@@ -374,16 +359,12 @@ async def handle_github_webhooks(background_tasks: BackgroundTasks, request: Req
             if not token_qsh or not isinstance(token_qsh, str):
                 get_logger().error("Bitbucket webhook JWT is missing 'qsh' claim")
                 return
-            expected_qsh = _compute_qsh(
-                method=request.method,
-                path=request.url.path,
-                query=request.url.query,
-            )
-            if not (token_qsh == "context-qsh" or hmac.compare_digest(token_qsh, expected_qsh)):
+            expected_qsh = _compute_qsh(method=request.method, path=request.url.path)
+            if not hmac.compare_digest(token_qsh, expected_qsh):
                 get_logger().error("Bitbucket webhook JWT validation failed: qsh mismatch")
                 return
             bearer_token = await get_bearer_token(shared_secret, client_key)
-            context["bitbucket_bearer_token"] = bearer_token
+            context['bitbucket_bearer_token'] = bearer_token
             context["settings"] = copy.deepcopy(global_settings)
             event = data["event"]
             agent = PRAgent()
@@ -393,21 +374,17 @@ async def handle_github_webhooks(background_tasks: BackgroundTasks, request: Req
                 log_context["event"] = "pull_request"
                 if pr_url:
                     with get_logger().contextualize(**log_context):
-                        if (
-                            get_identity_provider().verify_eligibility("bitbucket", sender_id, pr_url)
-                            is not Eligibility.NOT_ELIGIBLE
-                        ):
+                        if get_identity_provider().verify_eligibility("bitbucket",
+                                                        sender_id, pr_url) is not Eligibility.NOT_ELIGIBLE:
                             await _perform_commands_bitbucket("pr_commands", agent, pr_url, log_context, data)
-            elif event == "pullrequest:updated":  # PR updated, might be from a push (we will validate this later)
+            elif event == "pullrequest:updated": # PR updated, might be from a push (we will validate this later)
                 pr_url = data["data"]["pullrequest"]["links"]["html"]["href"]
                 log_context["api_url"] = pr_url
                 log_context["event"] = "pull_request"
                 if pr_url:
                     with get_logger().contextualize(**log_context):
-                        if (
-                            get_identity_provider().verify_eligibility("bitbucket", sender_id, pr_url)
-                            is not Eligibility.NOT_ELIGIBLE
-                        ):
+                        if get_identity_provider().verify_eligibility("bitbucket",
+                                                        sender_id, pr_url) is not Eligibility.NOT_ELIGIBLE:
                             await _perform_commands_bitbucket("push_commands", agent, pr_url, log_context, data)
             elif event == "pullrequest:comment_created":
                 pr_url = data["data"]["pullrequest"]["links"]["html"]["href"]
@@ -418,22 +395,17 @@ async def handle_github_webhooks(background_tasks: BackgroundTasks, request: Req
                     get_logger().info("Ignoring comment not starting with /")
                     return
                 with get_logger().contextualize(**log_context):
-                    if (
-                        get_identity_provider().verify_eligibility("bitbucket", sender_id, pr_url)
-                        is not Eligibility.NOT_ELIGIBLE
-                    ):
+                    if get_identity_provider().verify_eligibility("bitbucket",
+                                                                     sender_id, pr_url) is not Eligibility.NOT_ELIGIBLE:
                         await agent.handle_request(pr_url, comment_body)
         except Exception as e:
             get_logger().error(f"Failed to handle webhook: {e}")
-
     background_tasks.add_task(inner)
     return "OK"
-
 
 @router.get("/webhook")
 async def handle_webhook_health(request: Request, response: Response):
     return "Webhook server online!"
-
 
 @router.post("/installed")
 async def handle_installed_webhooks(request: Request, response: Response):
@@ -510,14 +482,13 @@ async def handle_installed_webhooks(request: Request, response: Response):
     secrets = {
         "shared_secret": shared_secret,
         "client_key": client_key,
-        "username": username,
+        "username": username
     }
     try:
         secret_provider.store_secret(client_key, json.dumps(secrets))
     except Exception as e:
         get_logger().error(f"Failed to register user: secret provider failure ({type(e).__name__})")
         return JSONResponse({"error": "Unable to register user"}, status_code=500)
-
 
 @router.post("/uninstalled")
 async def handle_uninstalled_webhooks(request: Request, response: Response):
@@ -538,5 +509,5 @@ def start():
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "3000")))
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     start()

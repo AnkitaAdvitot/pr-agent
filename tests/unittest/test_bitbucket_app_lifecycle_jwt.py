@@ -203,7 +203,7 @@ async def test_webhook_verifies_valid_qsh_without_aud_claim(monkeypatch):
     monkeypatch.setattr(bitbucket_app, "get_fork_safe_secret_provider", lambda: provider)
 
     # Compute expected QSH for POST /webhook
-    expected_qsh = bitbucket_app._compute_qsh("POST", "/webhook", "")
+    expected_qsh = bitbucket_app._compute_qsh("POST", "/webhook")
 
     # Bitbucket Cloud JWT: contains iss, iat, exp, qsh, sub - NO aud claim!
     now = int(time.time())
@@ -248,58 +248,6 @@ async def test_webhook_verifies_valid_qsh_without_aud_claim(monkeypatch):
     assert len(background_tasks.tasks) == 1
 
     # Run the background task
-    await background_tasks()
-    assert len(called_commands) == 1
-
-
-@pytest.mark.asyncio
-async def test_webhook_accepts_context_qsh(monkeypatch):
-    shared_secret = "secret-12345-very-long-secret-key-32bytes"
-    client_key = "workspace-client-key"
-    stored_secret = json.dumps({"shared_secret": shared_secret, "client_key": client_key})
-    provider = _InMemorySecretProvider({client_key: stored_secret})
-    monkeypatch.setattr(bitbucket_app, "get_fork_safe_secret_provider", lambda: provider)
-
-    now = int(time.time())
-    payload_jwt = {
-        "iss": client_key,
-        "iat": now,
-        "exp": now + 300,
-        "qsh": "context-qsh",
-        "sub": "account-id-123",
-    }
-    token = jwt.encode(payload_jwt, shared_secret, algorithm="HS256")
-
-    called_commands = []
-
-    async def fake_perform_commands(*args, **kwargs):
-        called_commands.append(args)
-
-    async def fake_get_bearer_token(*args):
-        return "bearer-token"
-
-    monkeypatch.setattr(bitbucket_app, "_perform_commands_bitbucket", fake_perform_commands)
-    monkeypatch.setattr(bitbucket_app, "get_bearer_token", fake_get_bearer_token)
-    monkeypatch.setattr(bitbucket_app, "context", {})
-
-    webhook_payload = {
-        "event": "pullrequest:created",
-        "data": {
-            "actor": {"account_id": "account-id-123", "nickname": "testuser", "type": "user"},
-            "pullrequest": {"links": {"html": {"href": "https://bitbucket.org/org/repo/pull-requests/1"}}},
-        },
-    }
-    request = _Request(
-        {"authorization": f"JWT {token}"},
-        webhook_payload,
-        method="POST",
-        path="/webhook",
-    )
-    background_tasks = BackgroundTasks()
-
-    result = await _route_endpoint("/webhook", "POST")(background_tasks, request)
-    assert result == "OK"
-
     await background_tasks()
     assert len(called_commands) == 1
 
