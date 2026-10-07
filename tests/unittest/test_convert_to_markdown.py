@@ -66,8 +66,7 @@ class TestConvertToMarkdown:
             <table>
             <tr><td>⏱️&nbsp;<strong>Estimated effort to review</strong>: 1 🔵⚪⚪⚪⚪</td></tr>
             <tr><td>🧪&nbsp;<strong>No relevant tests</strong></td></tr>
-            <tr><td>&nbsp;<strong>Possible issues</strong>: No
-            </td></tr>
+            <tr><td>&nbsp;<strong>Possible issues</strong>: No</td></tr>
             <tr><td>🔒&nbsp;<strong>No security concerns identified</strong></td></tr>
             </table>
         """)
@@ -92,7 +91,6 @@ class TestConvertToMarkdown:
             ### 🧪 No relevant tests
 
             ###  Possible issues: No
-
 
             ### 🔒 No security concerns identified
         """)
@@ -468,3 +466,85 @@ class TestExpandMinuteSuffix:
     def test_minute_suffix_in_compound_estimate(self):
         """'2h 30m' becomes '2h 30 minutes' (only the minute part is replaced)."""
         assert _expand_minute_suffix("2h 30m") == "2h 30 minutes"
+
+
+class TestGenericReviewKeyFormatting:
+    """Tests for security hardening and formatting of unknown/generic review keys (#3975)."""
+
+    def test_generic_branch_escapes_html_in_gfm(self):
+        input_data = {
+            "review": {
+                "custom_observation": '<img src="https://example.com/tracker.png" onerror="alert(1)">'
+            }
+        }
+        out = convert_to_markdown_v2(input_data, gfm_supported=True)
+        assert "<img" not in out
+        assert "&lt;img" in out
+        assert "alert(1)" in out
+        assert "<tr><td>&nbsp;<strong>Custom observation</strong>: &lt;img" in out
+
+    def test_generic_branch_escapes_html_without_gfm(self):
+        input_data = {
+            "review": {
+                "custom_observation": '<script>alert("xss")</script><details><summary>toggle</summary></details>'
+            }
+        }
+        out = convert_to_markdown_v2(input_data, gfm_supported=False)
+        assert "<script>" not in out
+        assert "<details>" not in out
+        assert "&lt;script&gt;" in out
+        assert "&lt;details&gt;" in out
+        assert "###  Custom observation: &lt;script&gt;" in out
+
+    def test_generic_branch_converts_newlines_to_br_in_gfm(self):
+        input_data = {
+            "review": {
+                "multi_line_note": "First line of notes\nSecond line of notes\r\nThird line of notes"
+            }
+        }
+        out = convert_to_markdown_v2(input_data, gfm_supported=True)
+        assert "First line of notes<br>Second line of notes<br>Third line of notes" in out
+        # Verify no unescaped newlines within the table row
+        row_content = [line for line in out.splitlines() if "Multi line note" in line][0]
+        assert "First line of notes<br>Second line of notes<br>Third line of notes</td></tr>" in row_content
+
+    def test_generic_branch_renders_nested_dict_as_yaml(self):
+        input_data = {
+            "review": {
+                "metadata_info": {
+                    "confidence": "high",
+                    "components": ["auth", "router"],
+                }
+            }
+        }
+        out = convert_to_markdown_v2(input_data, gfm_supported=True)
+        # Should NOT use python dict repr
+        assert "{'confidence': 'high'" not in out
+        # Should render as YAML with newlines turned into <br>
+        assert "confidence: high" in out
+        assert "components:<br>- auth<br>- router" in out
+
+    def test_generic_branch_renders_nested_list_as_yaml(self):
+        input_data = {
+            "review": {
+                "extra_findings": ["First finding", "Second finding"]
+            }
+        }
+        out = convert_to_markdown_v2(input_data, gfm_supported=True)
+        assert "['First finding'" not in out
+        assert "- First finding<br>- Second finding" in out
+
+    def test_generic_branch_escapes_html_inside_nested_structures(self):
+        input_data = {
+            "review": {
+                "payload": {
+                    "alert": '<img src="https://evil.com/x.png">',
+                    "nested_items": ['<a href="javascript:alert(1)">click</a>'],
+                }
+            }
+        }
+        out = convert_to_markdown_v2(input_data, gfm_supported=True)
+        assert "<img" not in out
+        assert "<a href=" not in out
+        assert "&lt;img" in out
+        assert "&lt;a href=" in out
