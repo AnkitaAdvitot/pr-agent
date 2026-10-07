@@ -518,9 +518,9 @@ class TestGenericReviewKeyFormatting:
             }
         }
         out = convert_to_markdown_v2(input_data, gfm_supported=True)
-        # Should NOT use python dict repr
+        # Reject Python dictionary repr
         assert "{'confidence': 'high'" not in out
-        # Should render as YAML with newlines turned into <br>
+        # Verify YAML lines become <br>
         assert "confidence: high" in out
         assert "components:<br>- auth<br>- router" in out
 
@@ -548,3 +548,30 @@ class TestGenericReviewKeyFormatting:
         assert "<a href=" not in out
         assert "&lt;img" in out
         assert "&lt;a href=" in out
+
+    def test_generic_branch_escapes_markdown_links_and_images(self):
+        input_data = {
+            "review": {
+                "injected_markdown": "[Click here](https://evil.com) and ![Image](https://evil.com/img.png)"
+            }
+        }
+        out_gfm = convert_to_markdown_v2(input_data, gfm_supported=True)
+        assert r"\[Click here\](https://evil.com)" in out_gfm
+        assert r"!\[Image\](https://evil.com/img.png)" in out_gfm
+
+        out_non_gfm = convert_to_markdown_v2(input_data, gfm_supported=False)
+        assert r"\[Click here\](https://evil.com)" in out_non_gfm
+        assert r"!\[Image\](https://evil.com/img.png)" in out_non_gfm
+
+    def test_generic_branch_renders_nested_structures_without_gfm(self):
+        input_data = {
+            "review": {
+                "metadata_info": {
+                    "confidence": "high",
+                    "components": ["auth", "router"],
+                }
+            }
+        }
+        out = convert_to_markdown_v2(input_data, gfm_supported=False)
+        # Verify review key is rendered as a heading and YAML as body block
+        assert "###  Metadata info\n\ncomponents:\n- auth\n- router\nconfidence: high\n\n" in out

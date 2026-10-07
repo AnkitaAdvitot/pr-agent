@@ -399,14 +399,17 @@ def convert_to_markdown_v2(output_data: dict,
                 value_str = yaml.safe_dump(list(value), default_flow_style=False).strip()
             else:
                 value_str = str(value).strip()
-            value_str = html.escape(value_str)
+            value_str = html.escape(value_str).replace("[", r"\[").replace("]", r"\]")
             if gfm_supported:
                 value_display = value_str.replace("\r\n", "<br>").replace("\n", "<br>")
                 markdown_text += "<tr><td>"
                 markdown_text += f"{emoji}&nbsp;<strong>{key_nice}</strong>: {value_display}"
                 markdown_text += "</td></tr>\n"
             else:
-                markdown_text += f"### {emoji} {key_nice}: {value_str}\n\n"
+                if "\n" in value_str:
+                    markdown_text += f"### {emoji} {key_nice}\n\n{value_str}\n\n"
+                else:
+                    markdown_text += f"### {emoji} {key_nice}: {value_str}\n\n"
 
     if gfm_supported:
         markdown_text += "</table>\n"
