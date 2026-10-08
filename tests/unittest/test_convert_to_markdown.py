@@ -556,12 +556,29 @@ class TestGenericReviewKeyFormatting:
             }
         }
         out_gfm = convert_to_markdown_v2(input_data, gfm_supported=True)
-        assert r"\[Click here\](https://evil.com)" in out_gfm
-        assert r"!\[Image\](https://evil.com/img.png)" in out_gfm
+        assert "\\[" not in out_gfm
 
         out_non_gfm = convert_to_markdown_v2(input_data, gfm_supported=False)
         assert r"\[Click here\](https://evil.com)" in out_non_gfm
         assert r"!\[Image\](https://evil.com/img.png)" in out_non_gfm
+
+    def test_generic_branch_escapes_unknown_key(self):
+        input_data = {"review": {"<img src=x> [link](https://example.com)": "v"}}
+        assert "&lt;img src=x&gt;" in convert_to_markdown_v2(input_data, gfm_supported=True)
+        out_non_gfm = convert_to_markdown_v2(input_data, gfm_supported=False)
+        assert "&lt;img src=x&gt;" in out_non_gfm
+        assert r"\[link\](https://example.com)" in out_non_gfm
+
+    def test_generic_branch_preserves_unicode_in_nested_yaml(self):
+        input_data = {"review": {"cafe_info": {"location": "café"}}}
+        out = convert_to_markdown_v2(input_data, gfm_supported=True)
+        assert "café" in out
+        assert r"\xE9" not in out
+
+    def test_generic_branch_handles_consecutive_carriage_returns_in_gfm(self):
+        input_data = {"review": {"carriage_note": "line1\r\rline2"}}
+        out = convert_to_markdown_v2(input_data, gfm_supported=True)
+        assert "line1<br><br>line2" in out
 
     def test_generic_branch_renders_nested_structures_without_gfm(self):
         input_data = {
@@ -575,3 +592,4 @@ class TestGenericReviewKeyFormatting:
         out = convert_to_markdown_v2(input_data, gfm_supported=False)
         # Verify review key is rendered as a heading and YAML as body block
         assert "###  Metadata info\n\ncomponents:\n- auth\n- router\nconfidence: high\n\n" in out
+

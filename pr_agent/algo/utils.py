@@ -393,19 +393,22 @@ def convert_to_markdown_v2(output_data: dict,
                 if gfm_supported:
                     markdown_text += "</td></tr>\n"
         else:
+            key_nice = html.escape(key_nice)
             if isinstance(value, (dict, list)):
-                value_str = yaml.safe_dump(value, default_flow_style=False).strip()
+                value_str = yaml.safe_dump(value, default_flow_style=False, allow_unicode=True).strip()
             elif isinstance(value, (tuple, set)):
-                value_str = yaml.safe_dump(list(value), default_flow_style=False).strip()
+                value_str = yaml.safe_dump(list(value), default_flow_style=False, allow_unicode=True).strip()
             else:
                 value_str = str(value).strip()
-            value_str = html.escape(value_str).replace("[", r"\[").replace("]", r"\]")
+            value_str = html.escape(value_str)
             if gfm_supported:
-                value_display = value_str.replace("\r\n", "<br>").replace("\n", "<br>")
+                value_display = "<br>".join(value_str.splitlines())
                 markdown_text += "<tr><td>"
                 markdown_text += f"{emoji}&nbsp;<strong>{key_nice}</strong>: {value_display}"
                 markdown_text += "</td></tr>\n"
             else:
+                key_nice = key_nice.replace("[", r"\[").replace("]", r"\]")
+                value_str = value_str.replace("[", r"\[").replace("]", r"\]")
                 if "\n" in value_str:
                     markdown_text += f"### {emoji} {key_nice}\n\n{value_str}\n\n"
                 else:
