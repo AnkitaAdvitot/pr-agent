@@ -592,4 +592,3 @@ class TestGenericReviewKeyFormatting:
         out = convert_to_markdown_v2(input_data, gfm_supported=False)
         # Verify review key is rendered as a heading and YAML as body block
         assert "###  Metadata info\n\ncomponents:\n- auth\n- router\nconfidence: high\n\n" in out
-
